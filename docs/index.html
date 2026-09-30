@@ -10,6 +10,7 @@
   canvas { max-width: 100vw; max-height: 100vh; display: block; }
   #status { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: #000c; padding: 8px 14px; border-radius: 8px; }
   #status:empty { display: none; }
+  #status progress { width: 100%; margin-top: 6px; }
 </style>
 </head>
 <body>
@@ -36,6 +37,21 @@ let depth = null; // Float32Array DH*DW, cm
 const smoothed = {}, baseline = {}; // fast and slow averages of palm cm, per hand
 
 function setStatus(s) { status.textContent = s; }
+// Download the model ourselves so the status can show a progress bar; ort then loads from memory
+async function fetchModel(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Depth model: HTTP ${res.status}`);
+  const total = +res.headers.get("content-length");
+  if (!total || res.headers.get("content-encoding")) return new Uint8Array(await res.arrayBuffer());  // size unknown: no bar
+  const buf = new Uint8Array(total), bar = Object.assign(document.createElement("progress"), { max: total });
+  status.append(document.createElement("br"), bar);
+  for (let got = 0, r = res.body.getReader();;) {
+    const { done, value } = await r.read();
+    if (done) break;
+    buf.set(value, got); got += value.length; bar.value = got;
+  }
+  return buf;
+}
 
 async function start() {
   const video = document.createElement("video");
@@ -57,10 +73,10 @@ async function start() {
   });
 
   setStatus("Loading depth model (~50 MB, cached after first visit)…");
-  const session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["webgpu", "wasm"] });
+  const session = await ort.InferenceSession.create(await fetchModel(MODEL_URL), { executionProviders: ["webgpu", "wasm"] });
   setStatus("");
 
-  depthLoop(session, video);
+  depthLoop(session, video).catch(e => { console.error(e); setStatus("Depth model error: " + e.message); });
   (function render() {
     fctx.setTransform(-1, 0, 0, 1, view.width, 0); fctx.drawImage(video, 0, 0); // mirror
     const res = hands.detectForVideo(frame, performance.now());

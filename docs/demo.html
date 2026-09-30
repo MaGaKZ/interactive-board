@@ -10,6 +10,7 @@
   canvas { width: min(100vw, calc(100vh * 4 / 3)); aspect-ratio: 4 / 3; display: block; touch-action: none; }
   #status { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: #000c; padding: 8px 14px; border-radius: 8px; }
   #status:empty { display: none; }
+  #status progress { width: 100%; margin-top: 6px; }
   #controls { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; flex-wrap: wrap; justify-content: center; gap: 14px; align-items: center; background: #000a; padding: 8px 14px; border-radius: 8px; max-width: calc(100vw - 32px); box-sizing: border-box; }
   #controls label { white-space: nowrap; display: flex; gap: 6px; align-items: center; }
   #controls input[type=range] { width: 90px; }
@@ -206,6 +207,21 @@ void main() {
 }`;
 
 function setStatus(s) { status.textContent = s; }
+// Download the model ourselves so the status can show a progress bar; ort then loads from memory
+async function fetchModel(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Depth model: HTTP ${res.status}`);
+  const total = +res.headers.get("content-length");
+  if (!total || res.headers.get("content-encoding")) return new Uint8Array(await res.arrayBuffer());  // size unknown: no bar
+  const buf = new Uint8Array(total), bar = Object.assign(document.createElement("progress"), { max: total });
+  status.append(document.createElement("br"), bar);
+  for (let got = 0, r = res.body.getReader();;) {
+    const { done, value } = await r.read();
+    if (done) break;
+    buf.set(value, got); got += value.length; bar.value = got;
+  }
+  return buf;
+}
 
 function program(gl) {
   const p = gl.createProgram();
@@ -255,7 +271,7 @@ async function start() {
     runningMode: "VIDEO", numHands: 2,
   });
   setStatus("Loading depth model (~50 MB, cached after first visit)…");
-  const session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["webgpu", "wasm"] });
+  const session = await ort.InferenceSession.create(await fetchModel(MODEL_URL), { executionProviders: ["webgpu", "wasm"] });
   setStatus("");
 
   // shown image, depth and hand all come from the same camera frame, so shadows can't trail a moving hand.
@@ -266,7 +282,7 @@ async function start() {
     steerByHand(hands.detectForVideo(snap, performance.now()).landmarks, W / H);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, videoTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, snap);
-  });
+  }).catch(e => { console.error(e); setStatus("Depth model error: " + e.message); });
   (function render() {
     fctx.setTransform(-1, 0, 0, 1, W, 0); fctx.drawImage(video, 0, 0); // live mirrored camera image, feeds the depth model
 

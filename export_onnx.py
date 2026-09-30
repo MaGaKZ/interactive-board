@@ -1,7 +1,7 @@
 # Export Depth Anything V2 metric (indoor) small to ONNX for the web app: .venv/bin/python export_onnx.py
 import onnx
 import torch
-from onnxruntime.transformers.float16 import convert_float_to_float16
+from onnxruntime.transformers.float16 import DEFAULT_OP_BLOCK_LIST, convert_float_to_float16
 
 from depth_anything_v2.dpt import DepthAnythingV2
 
@@ -11,4 +11,6 @@ m.load_state_dict(torch.load("checkpoints/depth_anything_v2_metric_hypersim_vits
 torch.onnx.export(m.eval(), torch.randn(1, 3, 294, 392), "docs/depth.onnx",
                   input_names=["image"], output_names=["depth"], opset_version=17, dynamo=False)
 # float16 weights halve download + memory (mobile tabs crashed on fp32); float32 in/out so the JS is unchanged
-onnx.save(convert_float_to_float16(onnx.load("docs/depth.onnx"), keep_io_types=True), "docs/depth.onnx")
+# Resize stays fp32: onnxruntime-web's WebGPU bicubic Resize shader fails on fp16 (no weights, so no size cost)
+onnx.save(convert_float_to_float16(onnx.load("docs/depth.onnx"), keep_io_types=True,
+                                   op_block_list=DEFAULT_OP_BLOCK_LIST + ["Resize"]), "docs/depth.onnx")
