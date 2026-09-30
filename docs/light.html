@@ -12,37 +12,39 @@
   #status:empty { display: none; }
   #controls { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; flex-wrap: wrap; justify-content: center; gap: 14px; align-items: center; background: #000a; padding: 8px 14px; border-radius: 8px; max-width: calc(100vw - 32px); box-sizing: border-box; }
   #controls label { white-space: nowrap; display: flex; gap: 6px; align-items: center; }
+  #controls input[type=range] { width: 90px; }
   #hint { opacity: .7; }
 </style>
 </head>
 <body>
 <canvas id="gl"></canvas>
 <div id="controls">
-  <label>Color <input id="color" type="color" value="#ffb070"></label>
-  <label>Brightness <input id="power" type="range" min="0" max="3" step="0.05" value="1.2"></label>
-  <label>Room light <input id="ambient" type="range" min="0" max="1" step="0.05" value="0.35"></label>
+  <label>Color <input id="color" type="color" value="#ffb875"></label>
+  <label>Intensity <input id="intensity" type="range" min="0" max="6" step="0.05" value="3"></label>
+  <label>Room <input id="exposure" type="range" min="0" max="1.5" step="0.05" value="0.5"></label>
+  <label>Relief <input id="relief" type="range" min="0" max="2" step="0.05" value="0.85"></label>
+  <label>Shadow <input id="shadow" type="range" min="0" max="1" step="0.05" value="0.7"></label>
   <span id="hint">Drag the light · scroll = closer/further · pinch to grab it</span>
 </div>
 <div id="status" role="status">Loading…</div>
 <script type="module">
+// Relighting approach ported from TypeGPU's "Monocular Light Injection" example (software-mansion/TypeGPU, MIT).
 import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
 
 const MODEL_URL = "depth.onnx";
-const SCALE = 1.0;          // depth calibration, same as index.html
-const DW = 392, DH = 294;   // depth model input
-const FOV_Y = 50;           // webcam vertical field of view (deg)
-const RANGE = 70;           // cm at which the light is half as strong
-const ORB = 900;            // orb radius in px = ORB / distance_cm
-const PINCH = 0.35;         // thumb-index gap / hand size below this = pinch
+const DW = 392, DH = 294;       // depth model input/output
+const PINCH = 0.35;             // thumb-index gap / hand size below this = pinch
+const RANGE_BLEND = 0.12;       // how fast the near/far range adapts
+const TEMPORAL_ALPHA = 0.32, MOTION_ALPHA = 0.8, MOTION_LOW = 0.02, MOTION_HIGH = 0.09; // steady when still, fast when moving
+const SURFACE_FAR_Z = -0.7, LIGHT_Z_MIN = SURFACE_FAR_Z + 0.04, LIGHT_Z_MAX = 1.65;
 const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
 
 const status = document.getElementById("status");
 const canvas = document.getElementById("gl");
 const small = new OffscreenCanvas(DW, DH), sctx = small.getContext("2d", { willReadFrequently: true });
-const depth = new Float32Array(DW * DH).fill(1000);  // cm, sharp current frame: distances, occlusion. "far" until the model runs
-const smooth = new Float32Array(DW * DH).fill(1000); // cm, blurred + averaged over time: surface directions only
-const orb = { u: 0.3, v: 0.45, z: 70 };            // screen position (0..1, top-left origin) + distance in cm
+const field = new Float32Array(DW * DH);           // 0 = far .. 1 = near, stabilized
+const light = { u: 0.34, v: 0.34, z: 0.42 };       // screen position (0..1, top-left) + scene depth (0 = nearest surface)
 const $ = id => document.getElementById(id);
 
 const VS = `#version 300 es
@@ -52,47 +54,152 @@ void main() {
   uv = vec2((p.x + 1.0) * 0.5, 1.0 - (p.y + 1.0) * 0.5);                     // top-left origin, like the images
   gl_Position = vec4(p, 0.0, 1.0);
 }`;
+
+// scene space: x,y = image position (centered, y down), z = depth (0 nearest surface, negative = further, positive = toward camera)
 const FS = `#version 300 es
 precision highp float;
+#define saturate(x) clamp(x, 0.0, 1.0)
 in vec2 uv; out vec4 outColor;
-uniform sampler2D video, depth, smoothDepth;
-uniform vec2 tanHalf, orbUv, res;
-uniform vec3 lightPos, lightCol;
-uniform float power, ambient, orbPx, range;
-const float SHAPE = 0.45; // 0 = ignore surface direction (smooth glow), 1 = full shading (noisier)
+uniform sampler2D video, field;
+uniform vec2 lightUv;
+uniform vec3 tint;
+uniform float lightZ, aspect, exposure, intensity, relief, shadowAmount;
 
-float bilinear(sampler2D tex, vec2 t) { // by hand: float textures aren't filterable on every GPU
-  vec2 s = vec2(textureSize(tex, 0)), f = t * s - 0.5, i = floor(f); f -= i;
-  ivec2 a = clamp(ivec2(i), ivec2(0), ivec2(s) - 1), b = clamp(ivec2(i) + 1, ivec2(0), ivec2(s) - 1);
-  return mix(mix(texelFetch(tex, a, 0).r, texelFetch(tex, ivec2(b.x, a.y), 0).r, f.x),
-             mix(texelFetch(tex, ivec2(a.x, b.y), 0).r, texelFetch(tex, b, 0).r, f.x), f.y);
+const float SURFACE_FAR_Z = -0.7, SHADOW_FAR_Z = -1.25;
+const float GRADIENT_RADIUS = 7.0, GRADIENT_LIMIT = 0.009, GRADIENT_NOISE = 0.0003;
+const float OCCLUSION_SCALE = 0.07, OCCLUSION_RANGE = 0.25, OCCLUSION_FLOOR = 0.012, OCCLUSION = 0.55;
+const float LIGHT_RADIUS = 0.85, LIGHT_WRAP = 0.25, RELIEF_SCALE = 200.0, SLOPE_COMPRESSION = 0.55;
+const float SPECULAR = 0.22, SPECULAR_POWER = 36.0, SPECULAR_F0 = 0.06, WHITE_POINT = 2.6, HIGHLIGHT_BLEACH = 2.0;
+const vec3 LUMINANCE = vec3(0.2126, 0.7152, 0.0722), AMBIENT_FILL = vec3(0.78, 0.86, 1.0);
+const float BULB_WORLD_RADIUS = 0.05, BULB_CAMERA_Z = 2.0, BULB_REFERENCE_Z = 0.42, BULB_CORE = 8.0, BULB_LIMB = 0.28;
+const float BULB_EDGE = 0.75, BULB_HALO = 1.6, BULB_HALO_SPAN = 1.2, BULB_VEIL = 0.12, BULB_VEIL_SPAN = 4.0, BULB_ONSET = 0.6;
+const int SHADOW_STEPS = 32;
+const float SHADOW_SPAN = 0.3, SHADOW_BASELINE = 0.005, SHADOW_BIAS = 0.014, SHADOW_SLOPE_BIAS = 0.02;
+const float SHADOW_THICKNESS = 0.7, SHADOW_THICKNESS_GROWTH = 2.6, SHADOW_SOFTNESS = 0.089, SHADOW_GAIN = 2.5, SHADOW_FRONT_FADE = 0.2;
+
+float depthAt(vec2 t) { return texture(field, t).r; }
+vec2 C(vec2 t) { return (t - 0.5) * vec2(aspect, 1.0); }  // uv -> scene xy
+vec2 U(vec2 p) { return p / vec2(aspect, 1.0) + 0.5; }    // scene xy -> uv
+float surfaceZ(float d) { return mix(SURFACE_FAR_Z, 0.0, d); }
+float shadowZ(float d) { return mix(SHADOW_FAR_Z, 0.0, d); }
+
+// trust the gentler of the two one-sided slopes: no huge normals at object edges
+float gentlerDelta(float back, float front) {
+  float b = abs(back), f = abs(front);
+  return (back * f + front * b) / max(b + f, 1e-9);
 }
-float D(vec2 t) { return bilinear(depth, t); }
-float S(vec2 t) { return bilinear(smoothDepth, t); }
+// drop slopes below the noise floor, cap steep ones smoothly
+vec2 surfaceSlope(vec2 g) {
+  float s = max(length(g), 1e-9);
+  float shrunk = sqrt(max(s * s - GRADIENT_NOISE * GRADIENT_NOISE, 0.0));
+  return g * (GRADIENT_LIMIT * tanh(shrunk / GRADIENT_LIMIT) / s);
+}
 
-vec3 P(vec2 t, float d) { // pixel + depth -> 3D point in cm (camera at origin, looking +z, y up)
-  return vec3((t.x * 2.0 - 1.0) * tanHalf.x * d, (1.0 - t.y * 2.0) * tanHalf.y * d, d);
+float dither(vec2 t) { vec2 p = t * 1024.0; return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y)); }
+
+// march from the surface toward the light through the depth field; anything poking up in between casts shadow
+float shadowFactor(vec3 origin, vec3 dir, float reach, float jitter) {
+  float stride = reach / float(SHADOW_STEPS);
+  float baseline = reach * (SHADOW_BASELINE / SHADOW_SPAN);
+  vec3 trail = origin - dir * baseline;
+  float rise = max(origin.z - shadowZ(depthAt(U(trail.xy))) - baseline * dir.z, 0.0) / baseline;
+  float occlusion = 0.0;
+  for (int i = 0; i < SHADOW_STEPS; i++) {
+    float travel = (float(i) + jitter) * stride;
+    vec3 probe = origin + dir * travel;
+    float sampleZ = shadowZ(depthAt(U(probe.xy)));
+    float diff = sampleZ - probe.z;
+    float bias = SHADOW_BIAS + travel * (SHADOW_SLOPE_BIAS + rise);
+    float thickness = SHADOW_THICKNESS * (1.0 + travel / SHADOW_SPAN * SHADOW_THICKNESS_GROWTH);
+    if (diff > bias && diff < thickness)
+      occlusion += saturate((diff - bias) / SHADOW_SOFTNESS) * (1.0 - saturate((sampleZ - lightZ) / SHADOW_FRONT_FADE));
+  }
+  return 1.0 - saturate(occlusion / float(SHADOW_STEPS) * SHADOW_GAIN);
+}
+
+float bulbRadius() { return BULB_WORLD_RADIUS * ((BULB_CAMERA_Z - BULB_REFERENCE_Z) / (BULB_CAMERA_Z - lightZ)); }
+
+float bulbExposure(float radius) { // how much of the bulb is not hidden behind real things
+  float open = 0.0;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++)
+    open += smoothstep(0.0, 0.08, lightZ - surfaceZ(depthAt(U(C(lightUv) + vec2(x, y) * radius * 0.6))));
+  return open / 9.0;
+}
+
+float compress(float v) { return v * (v / (WHITE_POINT * WHITE_POINT) + 1.0) / (v + 1.0); }
+vec3 tonemap(vec3 c) {
+  float lum = max(dot(c, LUMINANCE), 1e-4), mapped = compress(lum);
+  vec3 perChannel = c * (c / vec3(WHITE_POINT * WHITE_POINT) + 1.0) / (c + 1.0);
+  return saturate(mix(c * (mapped / lum), perChannel, pow(saturate(mapped), HIGHLIGHT_BLEACH)));
 }
 
 void main() {
-  vec3 c = pow(texture(video, uv).rgb, vec3(2.2));             // to linear light
-  vec2 e = 3.0 / vec2(textureSize(depth, 0));                   // normals over a few depth pixels: less noise
-  vec3 p = P(uv, D(uv));                                        // sharp depth: no glow bleeding past edges
-  vec2 ex = vec2(e.x, 0), ey = vec2(0, e.y);
-  vec3 n = normalize(cross(P(uv + ex, S(uv + ex)) - P(uv - ex, S(uv - ex)), P(uv + ey, S(uv + ey)) - P(uv - ey, S(uv - ey))));
-  if (n.z > 0.0) n = -n;                                        // surfaces face the camera
+  vec3 camera = saturate(texture(video, uv).rgb);
+  vec2 tx = 1.0 / vec2(textureSize(field, 0));
+  float center = depthAt(uv);
 
-  vec3 L = lightPos - p; float dist = length(L);
-  float diff = mix(1.0, max((dot(n, L / dist) + 0.3) / 1.3, 0.0), SHAPE); // mostly distance, a bit of surface direction
-  float att = 1.0 / (1.0 + pow(dist / range, 2.0));
-  vec3 col = c * (ambient + lightCol * power * diff * att * 6.0);
+  // surface slope -> normal
+  float r = GRADIENT_RADIUS;
+  vec2 grad = surfaceSlope(vec2(
+    gentlerDelta(center - depthAt(uv - vec2(r * tx.x, 0)), depthAt(uv + vec2(r * tx.x, 0)) - center),
+    gentlerDelta(center - depthAt(uv - vec2(0, r * tx.y)), depthAt(uv + vec2(0, r * tx.y)) - center)) / r);
+  vec2 slope = grad * (relief * RELIEF_SCALE);
+  vec3 normal = normalize(vec3(-slope / (1.0 + length(slope) * SLOPE_COMPRESSION), 1.0));
 
-  // the orb itself: bright core + halo, hidden where a real surface is in front of it
-  float r = length((uv - orbUv) * res) / orbPx;
-  float visible = smoothstep(-3.0, 3.0, D(uv) - lightPos.z);
-  col += lightCol * (smoothstep(1.0, 0.75, r) * 2.0 + exp(-r * 0.8) * 0.5 * power) * visible;
+  // contact shading: darker where nearby surfaces rise just in front of this one (creases, under the chin)
+  float occ = 0.0;
+  for (int k = 0; k < 2; k++) {
+    float radius = k == 0 ? 3.0 : 9.0;
+    for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+      if (x == 0 && y == 0) continue;
+      float diff = depthAt(uv + vec2(x, y) * radius * tx) - center;
+      occ += saturate(max(diff - OCCLUSION_FLOOR, 0.0) / OCCLUSION_SCALE) * (1.0 - saturate(abs(diff) / OCCLUSION_RANGE));
+    }
+  }
+  float occlusion = mix(1.0, 1.0 - saturate(occ / 16.0), OCCLUSION);
 
-  outColor = vec4(pow(col, vec3(1.0 / 2.2)), 1.0);
+  float noise = dither(uv);
+  vec3 position = vec3(C(uv), surfaceZ(center));
+  vec3 lightPos = vec3(C(lightUv), lightZ);
+  vec3 toLight = lightPos - position;
+  float dist = max(length(toLight), 1e-4);
+  vec3 dir = toLight / dist;
+  float spread = dist / LIGHT_RADIUS;
+  float falloff = 1.0 / (1.0 + spread * spread);
+  float wrapped = saturate((dot(normal, dir) + LIGHT_WRAP) / (1.0 + LIGHT_WRAP));
+  float lambert = wrapped * wrapped;
+
+  float shadow = 1.0;
+  if (shadowAmount > 0.0) {
+    vec3 origin = vec3(C(uv), shadowZ(center));
+    vec3 toL = lightPos - origin;
+    float d = max(length(toL), 1e-4);
+    float reach = d * (SHADOW_SPAN / max(length(toL.xy), SHADOW_SPAN));
+    shadow = mix(1.0, shadowFactor(origin, toL / d, reach, noise), shadowAmount);
+  }
+
+  vec3 albedo = pow(camera, vec3(2.2));
+  vec3 halfDir = normalize(dir + vec3(0, 0, 1));
+  float lobe = pow(saturate(dot(normal, halfDir)), SPECULAR_POWER);
+  float highlight = lobe * (SPECULAR_F0 + (1.0 - SPECULAR_F0) * pow(1.0 - saturate(normal.z), 5.0));
+
+  vec3 lit = albedo * AMBIENT_FILL * (exposure * occlusion);
+  lit += albedo * tint * (lambert * falloff * shadow * intensity);
+  lit += tint * (highlight * falloff * shadow * occlusion * SPECULAR * intensity);
+
+  // the bulb: a small glowing sphere, hidden where a real surface is in front of it
+  float presence = saturate(intensity / BULB_ONSET);
+  float radius = bulbRadius();
+  float s = length(C(uv) - C(lightUv)) / radius;
+  float dome = sqrt(max(1.0 - saturate(s) * saturate(s), 0.0)), facing = dome * dome;
+  float solid = smoothstep(0.0, 0.02, lightZ + BULB_WORLD_RADIUS * dome - surfaceZ(center));
+  float edge = clamp(fwidth(s) * BULB_EDGE, 0.004, 0.3);
+  float coverage = (1.0 - smoothstep(1.0 - edge, 1.0 + edge, s)) * solid;
+  vec3 bulb = mix(tint, vec3(1), facing * facing) * (BULB_CORE * mix(BULB_LIMB, 1.0, facing));
+  lit = mix(lit, bulb * presence, coverage * presence);
+  lit += tint * ((exp(-s / BULB_HALO_SPAN) * BULB_HALO + exp(-s / BULB_VEIL_SPAN) * BULB_VEIL) * bulbExposure(radius)) * presence;
+
+  outColor = vec4(pow(tonemap(lit), vec3(1.0 / 2.2)) + (noise - 0.5) / 255.0, 1.0);
 }`;
 
 function setStatus(s) { status.textContent = s; }
@@ -111,7 +218,7 @@ function program(gl) {
 function texture(gl, unit) {
   const t = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
-  for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, k, gl.NEAREST); // float depth isn't filterable everywhere
+  for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, k, gl.LINEAR);
   for (const k of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D, k, gl.CLAMP_TO_EDGE);
   return t;
 }
@@ -134,12 +241,9 @@ async function start() {
   if (!gl) return setStatus("This browser has no WebGL2.");
   const prog = program(gl);
   const u = name => gl.getUniformLocation(prog, name);
-  const videoTex = texture(gl, 0), depthTex = texture(gl, 1), smoothTex = texture(gl, 2);
-  gl.uniform1i(u("video"), 0); gl.uniform1i(u("depth"), 1); gl.uniform1i(u("smoothDepth"), 2);
-  const tanY = Math.tan(FOV_Y / 2 * Math.PI / 180);
-  gl.uniform2f(u("tanHalf"), tanY * W / H, tanY);
-  gl.uniform2f(u("res"), W, H);
-  gl.uniform1f(u("range"), RANGE);
+  const videoTex = texture(gl, 0), fieldTex = texture(gl, 1);
+  gl.uniform1i(u("video"), 0); gl.uniform1i(u("field"), 1);
+  gl.uniform1f(u("aspect"), W / H);
 
   setStatus("Loading hand model…");
   const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm");
@@ -160,84 +264,86 @@ async function start() {
 
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, videoTex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, frame);
-    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, depthTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, DW, DH, 0, gl.RED, gl.FLOAT, depth);
-    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, smoothTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, DW, DH, 0, gl.RED, gl.FLOAT, smooth);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, fieldTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, DW, DH, 0, gl.RED, gl.FLOAT, field); // R16F: filterable everywhere
 
-    const z = orb.z;
-    gl.uniform3f(u("lightPos"), (orb.u * 2 - 1) * tanY * (W / H) * z, (1 - orb.v * 2) * tanY * z, z);
-    gl.uniform3f(u("lightCol"), ...hex($("color").value));
-    gl.uniform1f(u("power"), +$("power").value);
-    gl.uniform1f(u("ambient"), +$("ambient").value);
-    gl.uniform2f(u("orbUv"), orb.u, orb.v);
-    gl.uniform1f(u("orbPx"), ORB / z);
+    gl.uniform2f(u("lightUv"), light.u, light.v);
+    gl.uniform1f(u("lightZ"), light.z);
+    gl.uniform3f(u("tint"), ...hex($("color").value));
+    for (const k of ["intensity", "exposure", "relief"]) gl.uniform1f(u(k), +$(k).value);
+    gl.uniform1f(u("shadowAmount"), +$("shadow").value);
     gl.viewport(0, 0, W, H);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     requestAnimationFrame(render);
   })();
 }
 
-// depth model runs as fast as it can, independent of rendering
+// depth model -> disparity -> 0..1 field with a slowly adapting near/far range and motion-aware smoothing
 async function depthLoop(session, frame) {
-  const input = new Float32Array(3 * DH * DW), raw = new Float32Array(DW * DH), tmp = new Float32Array(DW * DH);
-  let first = true;
+  const input = new Float32Array(3 * DH * DW), disp = new Float32Array(DW * DH);
+  let range = null;
   for (;;) {
     sctx.drawImage(frame, 0, 0, DW, DH);
     const px = sctx.getImageData(0, 0, DW, DH).data;
     for (let i = 0; i < DW * DH; i++)
       for (let c = 0; c < 3; c++) input[c * DW * DH + i] = (px[i * 4 + c] / 255 - MEAN[c]) / STD[c];
-    const out = await session.run({ image: new ort.Tensor("float32", input, [1, 3, DH, DW]) });
-    const m = out.depth.data;
-    for (let i = 0; i < m.length; i++) depth[i] = raw[i] = m[i] * 100 * SCALE;
-    blur(raw, tmp, 4); blur(raw, tmp, 4); // two box blurs ~ gaussian: removes blocky noise
-    for (let i = 0; i < m.length; i++) smooth[i] = first ? raw[i] : 0.5 * smooth[i] + 0.5 * raw[i]; // steadier over time
-    first = false;
+    const m = (await session.run({ image: new ort.Tensor("float32", input, [1, 3, DH, DW]) })).depth.data;
+    for (let i = 0; i < m.length; i++) disp[i] = 1 / Math.max(m[i], 0.05);
+
+    const sample = Array.from({ length: Math.floor(disp.length / 17) }, (_, k) => disp[k * 17]).sort((a, b) => a - b);
+    const low = sample[Math.floor(sample.length * 0.02)], high = Math.max(sample[Math.floor(sample.length * 0.98)], low + 1e-3);
+    const reset = !range;
+    range = reset ? [low, high] : [range[0] + (low - range[0]) * RANGE_BLEND, range[1] + (high - range[1]) * RANGE_BLEND];
+    const span = Math.max(range[1] - range[0], 1e-3);
+
+    for (let i = 0; i < disp.length; i++) {
+      const n = Math.min(1, Math.max(0, (disp[i] - range[0]) / span));
+      if (reset) { field[i] = n; continue; }
+      const t = Math.min(1, Math.max(0, (Math.abs(n - field[i]) - MOTION_LOW) / (MOTION_HIGH - MOTION_LOW)));
+      const alpha = TEMPORAL_ALPHA + (MOTION_ALPHA - TEMPORAL_ALPHA) * t * t * (3 - 2 * t);
+      field[i] += (n - field[i]) * alpha;
+    }
   }
 }
 
-// separable box blur of a DW x DH image, in place (tmp is scratch)
-function blur(a, tmp, r) {
-  for (let y = 0; y < DH; y++) for (let x = 0; x < DW; x++) {
-    let s = 0, n = 0;
-    for (let k = Math.max(0, x - r); k <= Math.min(DW - 1, x + r); k++) { s += a[y * DW + k]; n++; }
-    tmp[y * DW + x] = s / n;
-  }
-  for (let y = 0; y < DH; y++) for (let x = 0; x < DW; x++) {
-    let s = 0, n = 0;
-    for (let k = Math.max(0, y - r); k <= Math.min(DH - 1, y + r); k++) { s += tmp[k * DW + x]; n++; }
-    a[y * DW + x] = s / n;
-  }
-}
+const fieldAt = (x, y) => field[Math.min(DH - 1, Math.max(0, Math.floor(y * DH))) * DW + Math.min(DW - 1, Math.max(0, Math.floor(x * DW)))];
+const surfaceZ = d => SURFACE_FAR_Z * (1 - d);
+const clampZ = z => Math.min(LIGHT_Z_MAX, Math.max(LIGHT_Z_MIN, z));
 
-const depthAt = (x, y) => depth[Math.min(DH - 1, Math.max(0, Math.floor(y * DH))) * DW + Math.min(DW - 1, Math.max(0, Math.floor(x * DW)))];
-
-// pinch (thumb tip + index tip together) near the orb grabs it; it follows the pinch and sits at the hand's depth
+// pinch (thumb tip + index tip together) near the light grabs it; it follows the pinch, just in front of the hand
 function pinchGrab(allHands, held, aspect) {
   for (const lms of allHands) {
     const d = (a, b) => Math.hypot((lms[a].x - lms[b].x) * aspect, lms[a].y - lms[b].y);
     if (d(4, 8) / d(0, 9) > PINCH) continue;
     const pu = (lms[4].x + lms[8].x) / 2, pv = (lms[4].y + lms[8].y) / 2;
-    if (!held && Math.hypot((pu - orb.u) * aspect, pv - orb.v) > 0.12) continue;
-    const palm = [0, 5, 9, 13, 17].map(i => depthAt(lms[i].x, lms[i].y)).sort((a, b) => a - b)[2]; // median
-    orb.u = pu; orb.v = pv;
-    orb.z = 0.7 * orb.z + 0.3 * Math.max(15, palm - 3); // a little in front of the hand, smoothed
+    if (!held && Math.hypot((pu - light.u) * aspect, pv - light.v) > 0.12) continue;
+    const palm = [0, 5, 9, 13, 17].map(i => fieldAt(lms[i].x, lms[i].y)).sort((a, b) => a - b)[2]; // median
+    light.u = pu; light.v = pv;
+    light.z = clampZ(0.7 * light.z + 0.3 * (surfaceZ(palm) + 0.08));
     return true;
   }
   return false;
 }
 
-// mouse / touch: drag the orb, wheel moves it closer/further
+// mouse / touch: drag the light, wheel pushes it closer/further
 let dragging = false;
 const toUv = e => { const r = canvas.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; };
-const onOrb = e => { const [x, y] = toUv(e), r = canvas.getBoundingClientRect(); return Math.hypot((x - orb.u) * r.width, (y - orb.v) * r.height) < Math.max(24, ORB / orb.z * r.width / canvas.width * 2); };
-canvas.addEventListener("pointerdown", e => { if (onOrb(e)) { dragging = true; canvas.setPointerCapture(e.pointerId); canvas.style.cursor = "grabbing"; } });
+const onLight = e => {
+  const [x, y] = toUv(e), r = canvas.getBoundingClientRect();
+  const radiusPx = 0.05 * ((2 - 0.42) / (2 - light.z)) * r.height; // same size as the drawn bulb
+  return Math.hypot((x - light.u) * r.width, (y - light.v) * r.height) < Math.max(24, radiusPx * 2);
+};
+canvas.addEventListener("pointerdown", e => { if (onLight(e)) { dragging = true; canvas.setPointerCapture(e.pointerId); canvas.style.cursor = "grabbing"; } });
 canvas.addEventListener("pointermove", e => {
-  if (dragging) [orb.u, orb.v] = toUv(e);
-  else canvas.style.cursor = onOrb(e) ? "grab" : "default";
+  if (dragging) [light.u, light.v] = toUv(e);
+  else canvas.style.cursor = onLight(e) ? "grab" : "default";
 });
 canvas.addEventListener("pointerup", () => { dragging = false; canvas.style.cursor = "grab"; });
-canvas.addEventListener("wheel", e => { e.preventDefault(); orb.z = Math.min(300, Math.max(15, orb.z * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  const delta = e.deltaY * (e.deltaMode === 1 ? 16 : 1);
+  light.z = clampZ(light.z + Math.sign(delta) * Math.min(Math.abs(delta), 60) * 0.0015);
+}, { passive: false });
 
 start().catch(e => { console.error(e); setStatus("Error: " + e.message); });
 </script>
