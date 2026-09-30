@@ -7,27 +7,17 @@
 <style>
   :root { --bg: #111; --fg: #eee; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 15px system-ui, sans-serif; display: grid; place-items: center; min-height: 100vh; }
-  #stage { position: relative; width: min(100vw, calc(100vh * 4 / 3)); aspect-ratio: 4 / 3; }
-  #stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  canvas { max-width: 100vw; max-height: 100vh; display: block; }
   #status { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: #000c; padding: 8px 14px; border-radius: 8px; }
   #status:empty { display: none; }
-  #controls { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; align-items: center; background: #000a; padding: 8px 14px; border-radius: 8px; }
-  #controls label { white-space: nowrap; }
-  button { font: inherit; white-space: nowrap; padding: 6px 12px; border-radius: 6px; border: 1px solid #fff6; background: #fff1; color: var(--fg); cursor: pointer; }
 </style>
 </head>
 <body>
-<div id="stage"><canvas id="gl"></canvas><canvas id="view"></canvas></div>
-<div id="controls">
-  <button id="place">Place sun at my hand</button>
-  <label>Sun distance <input id="dist" type="range" min="20" max="250" value="80"> <output id="distOut">80 cm</output></label>
-  <label>Hide beyond <input id="cut" type="range" min="30" max="400" value="170"> <output id="cutOut">170 cm</output></label>
-</div>
+<canvas id="view"></canvas>
 <div id="status" role="status">Loading…</div>
 <script type="module">
 import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/vision_bundle.mjs";
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
-import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.js";
 
 const MODEL_URL = "depth.onnx";   // Depth Anything V2 metric (indoor) small, exported by export_onnx.py
 const SCALE = 1.0;  // calibration: palm at known distance -> SCALE = real_cm / shown_cm
@@ -37,122 +27,15 @@ const TIPS = [4, 8, 12, 16, 20];
 const PALM = [0, 1, 5, 9, 13, 17]; // wrist, thumb base, finger bases: already in polygon order
 const NEAR = 30, FAR = 150; // cm range for line thickness and the HUD bar
 const TREND = 3; // cm the palm must move vs. its recent average to show closer/further
-const FOV = 50;  // webcam vertical field of view (deg); only changes how big/where planets appear
-const SOFT = 2;  // cm of blending where hand and planet are at almost the same depth
-const CUT_SOFT = 10; // cm fade band at the background cutoff
 const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
 
 const status = document.getElementById("status");
 const view = document.getElementById("view"), ctx = view.getContext("2d");
-const glCanvas = document.getElementById("gl");
 const small = new OffscreenCanvas(DW, DH), sctx = small.getContext("2d", { willReadFrequently: true });
-const frame = document.createElement("canvas"), fctx = frame.getContext("2d");
-const depth = new Float32Array(DW * DH).fill(1e4); // cm; "infinitely far" until the model runs
-let hasDepth = false, lastPalm = null;
+let depth = null; // Float32Array DH*DW, cm
 const smoothed = {}, baseline = {}; // fast and slow averages of palm cm, per hand
 
 function setStatus(s) { status.textContent = s; }
-
-// ---------- realistic sun (units = cm, camera at origin looking down -z) ----------
-const NOISE = `
-  float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
-  float noise(vec3 x) {
-    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
-    return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
-               mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
-  }
-  float fbm(vec3 p) { float v = 0.0, a = 0.5; for (int k = 0; k < 5; k++) { v += a * noise(p); p *= 2.03; a *= 0.5; } return v; }`;
-const SUN_R = 7; // cm
-const time = { value: 0 };
-
-const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(FOV, 4 / 3, 1, 2000);
-const sunGroup = new THREE.Group();
-scene.add(sunGroup);
-
-// surface: boiling granulation + sunspots-ish dark cells + limb darkening
-const sun = new THREE.Mesh(new THREE.SphereGeometry(SUN_R, 96, 64), new THREE.ShaderMaterial({
-  uniforms: { time },
-  vertexShader: `
-    varying vec3 vObj, vNormal, vViewPos;
-    void main() {
-      vObj = normalize(position); vNormal = normalize(normalMatrix * normal);
-      vec4 mv = modelViewMatrix * vec4(position, 1.0); vViewPos = mv.xyz;
-      gl_Position = projectionMatrix * mv;
-    }`,
-  fragmentShader: NOISE + `
-    uniform float time;
-    varying vec3 vObj, vNormal, vViewPos;
-    void main() {
-      vec3 p = vObj * 3.0;
-      vec3 warp = vec3(fbm(p + time * 0.05), fbm(p + 5.2 - time * 0.04), fbm(p + 9.1 + time * 0.03));
-      float big = fbm(p + warp * 1.5);                      // large convection flow
-      float gran = fbm(vObj * 28.0 + vec3(0.0, time * 0.2, 0.0)); // fine granules
-      float t = 0.8 * big + 0.2 * gran;
-      vec3 col = mix(vec3(0.8, 0.28, 0.02), vec3(1.0, 0.58, 0.1), smoothstep(0.25, 0.55, t));
-      col = mix(col, vec3(1.0, 0.9, 0.55), smoothstep(0.55, 0.8, t));
-      float mu = clamp(dot(normalize(vNormal), normalize(-vViewPos)), 0.0, 1.0);
-      col *= 0.15 + 0.85 * pow(mu, 0.7);                     // limb darkening: edges dimmer and redder
-      col += vec3(1.0, 0.35, 0.05) * pow(1.0 - mu, 4.0) * 0.25; // hot rim
-      gl_FragColor = vec4(pow(col, vec3(2.2)) * 1.2, 1.0); // colors above are sRGB, scene is linear
-    }`,
-}));
-sunGroup.add(sun);
-
-// corona: camera-facing glow with slowly shifting streamers; writes depth so real objects in front hide it
-const corona = new THREE.Mesh(new THREE.PlaneGeometry(SUN_R * 8, SUN_R * 8), new THREE.ShaderMaterial({
-  uniforms: { time }, transparent: true,
-  vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
-  fragmentShader: NOISE + `
-    uniform float time;
-    varying vec2 vUv;
-    void main() {
-      vec2 q = vUv * 2.0 - 1.0;
-      float r = length(q) * 4.0;                             // in sun radii: 1.0 = sun edge
-      float ang = atan(q.y, q.x);
-      float streak = 0.55 + 0.45 * fbm(vec3(cos(ang) * 3.0, sin(ang) * 3.0, r * 0.4 - time * 0.08));
-      float glow = exp(-(r - 1.0) * 2.4) * streak + exp(-(r - 1.0) * 9.0) * 0.6;
-      vec3 col = mix(vec3(1.0, 0.45, 0.08), vec3(1.0, 0.85, 0.55), exp(-(r - 1.0) * 4.0));
-      gl_FragColor = vec4(pow(col, vec3(2.2)), clamp(glow, 0.0, 1.0) * step(0.98, r));
-    }`,
-}));
-sunGroup.add(corona);
-
-const distInput = document.getElementById("dist"), distOut = document.getElementById("distOut");
-function setSunDistance(cm) {
-  cm = Math.round(Math.min(250, Math.max(20, cm)));
-  sunGroup.position.z = -cm; distInput.value = cm; distOut.textContent = `${cm} cm`;
-}
-setSunDistance(80);
-distInput.oninput = () => setSunDistance(+distInput.value);
-const cutInput = document.getElementById("cut"), cutOut = document.getElementById("cutOut");
-cutInput.oninput = () => { compose.uniforms.cut.value = +cutInput.value; cutOut.textContent = `${cutInput.value} cm`; };
-document.getElementById("place").onclick = () => lastPalm && setSunDistance(lastPalm);
-
-// ---------- compositing: camera image vs. 3D scene, nearest one wins per pixel ----------
-const depthTex = new THREE.DataTexture(depth, DW, DH, THREE.RedFormat, THREE.FloatType); // nearest filter: safe on all GPUs
-const compose = new THREE.ShaderMaterial({
-  uniforms: { tVideo: { value: null }, tScene: { value: null }, tSceneDepth: { value: null }, tReal: { value: depthTex },
-    near: { value: camera.near }, far: { value: camera.far }, soft: { value: SOFT }, cut: { value: 170 }, cutSoft: { value: CUT_SOFT } },
-  vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }",
-  fragmentShader: `
-    #include <packing>
-    varying vec2 vUv;
-    uniform sampler2D tVideo, tScene, tSceneDepth, tReal;
-    uniform float near, far, soft, cut, cutSoft;
-    void main() {
-      vec4 s = texture2D(tScene, vUv);
-      float sceneCm = -perspectiveDepthToViewZ(texture2D(tSceneDepth, vUv).x, near, far);
-      float realCm = texture2D(tReal, vec2(vUv.x, 1.0 - vUv.y)).r; // depth rows are top-down
-      float show = s.a * smoothstep(-soft, soft, realCm - sceneCm);  // planet in front of the real world?
-      vec3 video = texture2D(tVideo, vUv).rgb * (1.0 - smoothstep(cut - cutSoft, cut + cutSoft, realCm)); // room far away -> black
-      gl_FragColor = vec4(mix(video, s.rgb / max(s.a, 1e-4), show), 1.0);
-      #include <colorspace_fragment>
-    }`,
-});
-const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), compose);
-const quadScene = new THREE.Scene(); quadScene.add(quad);
-const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
 async function start() {
   const video = document.createElement("video");
@@ -163,15 +46,7 @@ async function start() {
     return setStatus("Camera blocked: allow camera access for this site and reload.");
   }
   await video.play();
-  const W = video.videoWidth, H = video.videoHeight;
-  view.width = frame.width = W; view.height = frame.height = H;
-  camera.aspect = W / H; camera.updateProjectionMatrix();
-
-  const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias: true });
-  renderer.setSize(W, H, false);
-  const rt = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, samples: 4, depthTexture: new THREE.DepthTexture(W, H) });
-  const videoTex = new THREE.CanvasTexture(frame); videoTex.colorSpace = THREE.SRGBColorSpace;
-  Object.assign(compose.uniforms, { tVideo: { value: videoTex }, tScene: { value: rt.texture }, tSceneDepth: { value: rt.depthTexture } });
+  view.width = video.videoWidth; view.height = video.videoHeight;
 
   setStatus("Loading hand model…");
   const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm");
@@ -184,37 +59,25 @@ async function start() {
   const session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ["webgpu", "wasm"] });
   setStatus("");
 
-  depthLoop(session);
-  const clock = new THREE.Clock();
-  renderer.setAnimationLoop(() => {
-    fctx.setTransform(-1, 0, 0, 1, W, 0); fctx.drawImage(video, 0, 0, W, H); // mirrored frame used by everything
-    videoTex.needsUpdate = true;
-
-    time.value = clock.getElapsedTime();
-    sun.rotation.y = time.value * 0.03;
-    corona.lookAt(camera.position);
-    renderer.setClearColor(0x000000, 0);
-    renderer.setRenderTarget(rt); renderer.render(scene, camera);
-    renderer.setRenderTarget(null); renderer.render(quadScene, quadCam);
-
-    ctx.clearRect(0, 0, W, H);
-    const res = hands.detectForVideo(frame, performance.now());
-    if (hasDepth) res.landmarks.forEach((lms, n) => drawHand(lms, res.handedness[n][0].categoryName, n));
-  });
+  depthLoop(session, video);
+  (function render() {
+    ctx.save(); ctx.scale(-1, 1); ctx.drawImage(video, -view.width, 0); ctx.restore(); // mirror
+    const res = hands.detectForVideo(view, performance.now());
+    if (depth) res.landmarks.forEach((lms, n) => drawHand(lms, res.handedness[n][0].categoryName, n));
+    requestAnimationFrame(render);
+  })();
 }
 
 // runs as fast as the model allows, independent of the render loop
-async function depthLoop(session) {
+async function depthLoop(session, video) {
   const input = new Float32Array(3 * DH * DW);
   for (;;) {
-    sctx.drawImage(frame, 0, 0, DW, DH);
+    sctx.setTransform(-1, 0, 0, 1, DW, 0); sctx.drawImage(video, 0, 0, DW, DH); sctx.resetTransform(); // clean mirrored frame
     const px = sctx.getImageData(0, 0, DW, DH).data;
     for (let i = 0; i < DW * DH; i++)
       for (let c = 0; c < 3; c++) input[c * DW * DH + i] = (px[i * 4 + c] / 255 - MEAN[c]) / STD[c];
     const out = await session.run({ image: new ort.Tensor("float32", input, [1, 3, DH, DW]) });
-    const m = out.depth.data;
-    for (let i = 0; i < m.length; i++) depth[i] = m[i] * 100 * SCALE;
-    depthTex.needsUpdate = true; hasDepth = true;
+    depth = out.depth.data.map(m => m * 100 * SCALE);
   }
 }
 
@@ -237,7 +100,6 @@ function drawHand(lms, side, n) {
   vals.sort((a, b) => a - b);
   const raw = vals[vals.length >> 1];
   const palm = smoothed[side] = SMOOTH * raw + (1 - SMOOTH) * (smoothed[side] ?? raw);
-  lastPalm = palm;
 
   const recent = baseline[side] = 0.05 * palm + 0.95 * (baseline[side] ?? palm);
   const trend = palm < recent - TREND ? "▲ closer" : palm > recent + TREND ? "▼ further" : "";
@@ -257,7 +119,6 @@ function drawHand(lms, side, n) {
 
   const pc = PALM.reduce((s, i) => [s[0] + px[i][0] / 6, s[1] + px[i][1] / 6], [0, 0]);
   label(`${palm.toFixed(0)} cm ${trend}`, pc[0] - 40, pc[1], 28, "#fff");
-  label(palm < -sunGroup.position.z ? "in front of sun" : "behind sun", pc[0] - 40, pc[1] + 30, 14, "#fff");
 
   // HUD bar: fuller = closer (NEAR..FAR cm)
   const y = 20 + n * 40;
