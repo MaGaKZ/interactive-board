@@ -1,0 +1,5 @@
+torch
+torchvision
+opencv-python
+mediapipe==0.10.35
+onnx  # only for export_onnx.py
