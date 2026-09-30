@@ -2,10 +2,10 @@
 
 Hand tracking (MediaPipe) + metric depth (Depth Anything V2 Small, indoor) → palm distance from the camera in cm.
 
-## Web
-`web/` is a static site (runs in the browser, WebGPU). Serve it over HTTPS (or `localhost`):
+## Web (GitHub Pages)
+`docs/` is a static site (runs in the browser, WebGPU). Serve it over HTTPS (or `localhost`):
 
-    cd web && python3 -m http.server 8765
+    cd docs && python3 -m http.server 8765
 
 ## Python (desktop)
 
@@ -16,4 +16,4 @@ Hand tracking (MediaPipe) + metric depth (Depth Anything V2 Small, indoor) → p
     curl -Lo checkpoints/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
     .venv/bin/python main.py
 
-`export_onnx.py` rebuilds `web/depth.onnx` from the checkpoint.
+`export_onnx.py` rebuilds `docs/depth.onnx` from the checkpoint.
