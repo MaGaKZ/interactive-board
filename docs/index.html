@@ -12,7 +12,8 @@
   #status { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); background: #000c; padding: 8px 14px; border-radius: 8px; }
   #status:empty { display: none; }
   #controls { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 12px; align-items: center; background: #000a; padding: 8px 14px; border-radius: 8px; }
-  button { font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid #fff6; background: #fff1; color: var(--fg); cursor: pointer; }
+  #controls label { white-space: nowrap; }
+  button { font: inherit; white-space: nowrap; padding: 6px 12px; border-radius: 6px; border: 1px solid #fff6; background: #fff1; color: var(--fg); cursor: pointer; }
 </style>
 </head>
 <body>
@@ -20,6 +21,7 @@
 <div id="controls">
   <button id="place">Place sun at my hand</button>
   <label>Sun distance <input id="dist" type="range" min="20" max="250" value="80"> <output id="distOut">80 cm</output></label>
+  <label>Hide beyond <input id="cut" type="range" min="30" max="400" value="170"> <output id="cutOut">170 cm</output></label>
 </div>
 <div id="status" role="status">Loading…</div>
 <script type="module">
@@ -37,6 +39,7 @@ const NEAR = 30, FAR = 150; // cm range for line thickness and the HUD bar
 const TREND = 3; // cm the palm must move vs. its recent average to show closer/further
 const FOV = 50;  // webcam vertical field of view (deg); only changes how big/where planets appear
 const SOFT = 2;  // cm of blending where hand and planet are at almost the same depth
+const CUT_SOFT = 10; // cm fade band at the background cutoff
 const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
 
 const status = document.getElementById("status");
@@ -122,25 +125,28 @@ function setSunDistance(cm) {
 }
 setSunDistance(80);
 distInput.oninput = () => setSunDistance(+distInput.value);
+const cutInput = document.getElementById("cut"), cutOut = document.getElementById("cutOut");
+cutInput.oninput = () => { compose.uniforms.cut.value = +cutInput.value; cutOut.textContent = `${cutInput.value} cm`; };
 document.getElementById("place").onclick = () => lastPalm && setSunDistance(lastPalm);
 
 // ---------- compositing: camera image vs. 3D scene, nearest one wins per pixel ----------
 const depthTex = new THREE.DataTexture(depth, DW, DH, THREE.RedFormat, THREE.FloatType); // nearest filter: safe on all GPUs
 const compose = new THREE.ShaderMaterial({
   uniforms: { tVideo: { value: null }, tScene: { value: null }, tSceneDepth: { value: null }, tReal: { value: depthTex },
-    near: { value: camera.near }, far: { value: camera.far }, soft: { value: SOFT } },
+    near: { value: camera.near }, far: { value: camera.far }, soft: { value: SOFT }, cut: { value: 170 }, cutSoft: { value: CUT_SOFT } },
   vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }",
   fragmentShader: `
     #include <packing>
     varying vec2 vUv;
     uniform sampler2D tVideo, tScene, tSceneDepth, tReal;
-    uniform float near, far, soft;
+    uniform float near, far, soft, cut, cutSoft;
     void main() {
       vec4 s = texture2D(tScene, vUv);
       float sceneCm = -perspectiveDepthToViewZ(texture2D(tSceneDepth, vUv).x, near, far);
       float realCm = texture2D(tReal, vec2(vUv.x, 1.0 - vUv.y)).r; // depth rows are top-down
       float show = s.a * smoothstep(-soft, soft, realCm - sceneCm);  // planet in front of the real world?
-      gl_FragColor = vec4(mix(texture2D(tVideo, vUv).rgb, s.rgb / max(s.a, 1e-4), show), 1.0);
+      vec3 video = texture2D(tVideo, vUv).rgb * (1.0 - smoothstep(cut - cutSoft, cut + cutSoft, realCm)); // room far away -> black
+      gl_FragColor = vec4(mix(video, s.rgb / max(s.a, 1e-4), show), 1.0);
       #include <colorspace_fragment>
     }`,
 });
