@@ -3,3 +3,4 @@ torchvision
 opencv-python
 mediapipe==0.10.35
 onnx  # only for export_onnx.py
+onnxruntime  # only for export_onnx.py (fp16 conversion)
