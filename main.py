@@ -5,7 +5,6 @@ import torch
 import mediapipe as mp
 from mediapipe.tasks.python import BaseOptions, vision
 
-sys.path.insert(0, "Depth-Anything-V2/metric_depth")
 from depth_anything_v2.dpt import DepthAnythingV2
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"

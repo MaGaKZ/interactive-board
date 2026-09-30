@@ -1,8 +1,6 @@
 # Export Depth Anything V2 metric (indoor) small to ONNX for the web app: .venv/bin/python export_onnx.py
-import sys
 import torch
 
-sys.path.insert(0, "Depth-Anything-V2/metric_depth")
 from depth_anything_v2.dpt import DepthAnythingV2
 
 m = DepthAnythingV2(encoder="vits", features=64, out_channels=[48, 96, 192, 384], max_depth=20)

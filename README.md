@@ -9,7 +9,7 @@ Hand tracking (MediaPipe) + metric depth (Depth Anything V2 Small, indoor) → p
 
 ## Python (desktop)
 
-    git clone --recursive git@github.com:MaGaKZ/interactive-board.git
+    git clone git@github.com:MaGaKZ/interactive-board.git
     python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
     mkdir -p checkpoints
     curl -Lo checkpoints/depth_anything_v2_metric_hypersim_vits.pth https://huggingface.co/depth-anything/Depth-Anything-V2-Metric-Hypersim-Small/resolve/main/depth_anything_v2_metric_hypersim_vits.pth
