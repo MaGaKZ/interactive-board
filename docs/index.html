@@ -50,56 +50,75 @@ const smoothed = {}, baseline = {}; // fast and slow averages of palm cm, per ha
 
 function setStatus(s) { status.textContent = s; }
 
-// ---------- 3D solar system (units = cm, camera at origin looking down -z) ----------
-function stripes(colors) { // banded texture for gas giants
-  const c = document.createElement("canvas"); c.width = 4; c.height = 64;
-  const g = c.getContext("2d");
-  for (let y = 0; y < 64; y++) { g.fillStyle = colors[Math.floor(y / 64 * colors.length * 3) % colors.length]; g.fillRect(0, y, 4, 1); }
-  const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
-}
+// ---------- realistic sun (units = cm, camera at origin looking down -z) ----------
+const NOISE = `
+  float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+  float noise(vec3 x) {
+    vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+               mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+  }
+  float fbm(vec3 p) { float v = 0.0, a = 0.5; for (int k = 0; k < 5; k++) { v += a * noise(p); p *= 2.03; a *= 0.5; } return v; }`;
+const SUN_R = 7; // cm
+const time = { value: 0 };
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(FOV, 4 / 3, 1, 2000);
-scene.add(new THREE.AmbientLight(0xffffff, 0.25));
-const system = new THREE.Group();
-system.rotation.x = 0.35; // tilt so orbits pass in front of and behind the sun
-scene.add(system);
-system.add(new THREE.Mesh(new THREE.SphereGeometry(7, 48, 32), new THREE.MeshBasicMaterial({ color: 0xffc233 })));
-system.add(new THREE.PointLight(0xffffff, 4, 0, 0));
+const sunGroup = new THREE.Group();
+scene.add(sunGroup);
 
-// name, radius cm, orbit radius cm, color or texture, orbit speed
-const PLANETS = [
-  ["Mercury", 0.9, 12, 0xa0a0a0, 1.6],
-  ["Venus", 1.4, 16, 0xe8c27a, 1.2],
-  ["Earth", 1.5, 21, 0x3a7bd5, 1.0],
-  ["Mars", 1.1, 26, 0xc1440e, 0.8],
-  ["Jupiter", 4.5, 36, stripes(["#d8b98a", "#a8744f", "#efe2c8", "#b8865b"]), 0.45],
-  ["Saturn", 3.6, 48, stripes(["#e6d3a3", "#c9a96b", "#f1e5c4"]), 0.33],
-];
-const orbits = PLANETS.map(([, r, orbit, look, speed], i) => {
-  const pivot = new THREE.Object3D();
-  pivot.rotation.y = i * 1.3; // spread planets around
-  const mat = new THREE.MeshStandardMaterial(look instanceof THREE.Texture ? { map: look } : { color: look });
-  const planet = new THREE.Mesh(new THREE.SphereGeometry(r, 32, 16), mat);
-  planet.position.x = orbit;
-  if (i === 5) { // Saturn's rings
-    const ring = new THREE.Mesh(new THREE.RingGeometry(r * 1.3, r * 2.2, 64),
-      new THREE.MeshStandardMaterial({ color: 0xd9c49a, side: THREE.DoubleSide, transparent: true, opacity: 0.8 }));
-    ring.rotation.x = -1.2; planet.add(ring);
-  }
-  pivot.add(planet);
-  system.add(pivot);
-  const path = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints(
-    Array.from({ length: 128 }, (_, k) => new THREE.Vector3(Math.cos(k / 128 * Math.PI * 2) * orbit, 0, Math.sin(k / 128 * Math.PI * 2) * orbit))),
-    new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25 }));
-  system.add(path);
-  return { pivot, speed };
-});
+// surface: boiling granulation + sunspots-ish dark cells + limb darkening
+const sun = new THREE.Mesh(new THREE.SphereGeometry(SUN_R, 96, 64), new THREE.ShaderMaterial({
+  uniforms: { time },
+  vertexShader: `
+    varying vec3 vObj, vNormal, vViewPos;
+    void main() {
+      vObj = normalize(position); vNormal = normalize(normalMatrix * normal);
+      vec4 mv = modelViewMatrix * vec4(position, 1.0); vViewPos = mv.xyz;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: NOISE + `
+    uniform float time;
+    varying vec3 vObj, vNormal, vViewPos;
+    void main() {
+      vec3 p = vObj * 3.0;
+      vec3 warp = vec3(fbm(p + time * 0.05), fbm(p + 5.2 - time * 0.04), fbm(p + 9.1 + time * 0.03));
+      float big = fbm(p + warp * 1.5);                      // large convection flow
+      float gran = fbm(vObj * 28.0 + vec3(0.0, time * 0.2, 0.0)); // fine granules
+      float t = 0.8 * big + 0.2 * gran;
+      vec3 col = mix(vec3(0.8, 0.28, 0.02), vec3(1.0, 0.58, 0.1), smoothstep(0.25, 0.55, t));
+      col = mix(col, vec3(1.0, 0.9, 0.55), smoothstep(0.55, 0.8, t));
+      float mu = clamp(dot(normalize(vNormal), normalize(-vViewPos)), 0.0, 1.0);
+      col *= 0.15 + 0.85 * pow(mu, 0.7);                     // limb darkening: edges dimmer and redder
+      col += vec3(1.0, 0.35, 0.05) * pow(1.0 - mu, 4.0) * 0.25; // hot rim
+      gl_FragColor = vec4(pow(col, vec3(2.2)) * 1.2, 1.0); // colors above are sRGB, scene is linear
+    }`,
+}));
+sunGroup.add(sun);
+
+// corona: camera-facing glow with slowly shifting streamers; writes depth so real objects in front hide it
+const corona = new THREE.Mesh(new THREE.PlaneGeometry(SUN_R * 8, SUN_R * 8), new THREE.ShaderMaterial({
+  uniforms: { time }, transparent: true,
+  vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+  fragmentShader: NOISE + `
+    uniform float time;
+    varying vec2 vUv;
+    void main() {
+      vec2 q = vUv * 2.0 - 1.0;
+      float r = length(q) * 4.0;                             // in sun radii: 1.0 = sun edge
+      float ang = atan(q.y, q.x);
+      float streak = 0.55 + 0.45 * fbm(vec3(cos(ang) * 3.0, sin(ang) * 3.0, r * 0.4 - time * 0.08));
+      float glow = exp(-(r - 1.0) * 2.4) * streak + exp(-(r - 1.0) * 9.0) * 0.6;
+      vec3 col = mix(vec3(1.0, 0.45, 0.08), vec3(1.0, 0.85, 0.55), exp(-(r - 1.0) * 4.0));
+      gl_FragColor = vec4(pow(col, vec3(2.2)), clamp(glow, 0.0, 1.0) * step(0.98, r));
+    }`,
+}));
+sunGroup.add(corona);
 
 const distInput = document.getElementById("dist"), distOut = document.getElementById("distOut");
 function setSunDistance(cm) {
   cm = Math.round(Math.min(250, Math.max(20, cm)));
-  system.position.z = -cm; distInput.value = cm; distOut.textContent = `${cm} cm`;
+  sunGroup.position.z = -cm; distInput.value = cm; distOut.textContent = `${cm} cm`;
 }
 setSunDistance(80);
 distInput.oninput = () => setSunDistance(+distInput.value);
@@ -121,7 +140,7 @@ const compose = new THREE.ShaderMaterial({
       float sceneCm = -perspectiveDepthToViewZ(texture2D(tSceneDepth, vUv).x, near, far);
       float realCm = texture2D(tReal, vec2(vUv.x, 1.0 - vUv.y)).r; // depth rows are top-down
       float show = s.a * smoothstep(-soft, soft, realCm - sceneCm);  // planet in front of the real world?
-      gl_FragColor = vec4(mix(texture2D(tVideo, vUv).rgb, s.rgb, show), 1.0);
+      gl_FragColor = vec4(mix(texture2D(tVideo, vUv).rgb, s.rgb / max(s.a, 1e-4), show), 1.0);
       #include <colorspace_fragment>
     }`,
 });
@@ -165,8 +184,9 @@ async function start() {
     fctx.setTransform(-1, 0, 0, 1, W, 0); fctx.drawImage(video, 0, 0, W, H); // mirrored frame used by everything
     videoTex.needsUpdate = true;
 
-    const dt = clock.getDelta();
-    for (const o of orbits) o.pivot.rotation.y += o.speed * dt * 0.5;
+    time.value = clock.getElapsedTime();
+    sun.rotation.y = time.value * 0.03;
+    corona.lookAt(camera.position);
     renderer.setClearColor(0x000000, 0);
     renderer.setRenderTarget(rt); renderer.render(scene, camera);
     renderer.setRenderTarget(null); renderer.render(quadScene, quadCam);
@@ -231,7 +251,7 @@ function drawHand(lms, side, n) {
 
   const pc = PALM.reduce((s, i) => [s[0] + px[i][0] / 6, s[1] + px[i][1] / 6], [0, 0]);
   label(`${palm.toFixed(0)} cm ${trend}`, pc[0] - 40, pc[1], 28, "#fff");
-  label(palm < -system.position.z ? "in front of sun" : "behind sun", pc[0] - 40, pc[1] + 30, 14, "#fff");
+  label(palm < -sunGroup.position.z ? "in front of sun" : "behind sun", pc[0] - 40, pc[1] + 30, 14, "#fff");
 
   // HUD bar: fuller = closer (NEAR..FAR cm)
   const y = 20 + n * 40;
