@@ -47,7 +47,7 @@ async function start() {
   }
   await video.play();
   view.width = video.videoWidth; view.height = video.videoHeight;
-  const frame = new OffscreenCanvas(view.width, view.height), fctx = frame.getContext("2d"); // camera image, never shown
+  const frame = new OffscreenCanvas(view.width, view.height), fctx = frame.getContext("2d"); // mirrored camera image
 
   setStatus("Loading hand model…");
   const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm");
@@ -64,7 +64,7 @@ async function start() {
   (function render() {
     fctx.setTransform(-1, 0, 0, 1, view.width, 0); fctx.drawImage(video, 0, 0); // mirror
     const res = hands.detectForVideo(frame, performance.now());
-    ctx.fillStyle = "#000"; ctx.fillRect(0, 0, view.width, view.height);
+    ctx.drawImage(frame, 0, 0);
     if (depth) res.landmarks.forEach((lms, n) => drawHand(lms, res.handedness[n][0].categoryName));
     requestAnimationFrame(render);
   })();
